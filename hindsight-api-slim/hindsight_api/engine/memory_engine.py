@@ -9249,7 +9249,9 @@ class MemoryEngine(MemoryEngineInterface):
                        are requested, drop raw facts that a returned observation was consolidated from
                        (deduplication by provenance). Prefer a fitting observation at its source's
                        rank position; keep the raw source eligible if it cannot fit. Substitution is
-                       bounded to the ranked candidate window. No-op unless both types are requested.
+                       bounded to observations in the original ranked candidate window. Sources
+                       replaced by a delivered observation free slots for backfill. No-op unless
+                       both types are requested.
                        None resolves to the bank's recall_prefer_observations config.
             budget: Budget level for graph traversal (low=100, mid=300, high=600 units)
             max_tokens: Maximum tokens to return (counts only 'text' field, default 4096)
@@ -10688,7 +10690,7 @@ class MemoryEngine(MemoryEngineInterface):
 
             # Step 6: Pack and substitute observations atomically. Chunk selection
             # above retains its independent budget, including max_tokens=0.
-            raw_ids = {sr.id for sr in top_scored if sr.retrieval.fact_type in ("world", "experience")}
+            raw_ids = {sr.id for sr in scored_results if sr.retrieval.fact_type in ("world", "experience")}
             observation_sources = (
                 {
                     sr.id: [str(sid) for sid in sr.retrieval.source_memory_ids or [] if str(sid) in raw_ids]
@@ -10698,17 +10700,22 @@ class MemoryEngine(MemoryEngineInterface):
                 if prefer_observations and "observation" in fact_type and raw_types_requested
                 else None
             )
+            # Keep replacement observations bounded to the original window, but
+            # let selected substitutions free slots for lower-ranked candidates.
+            # Cutting the input here would let superseded sources crowd those
+            # candidates out even when the answer has plenty of token budget.
             step_start = time.perf_counter()
             selection = select_facts_within_budget(
-                fact_ids_ordered=[sr.id for sr in top_scored],
-                text_by_id={sr.id: sr.retrieval.text for sr in top_scored},
+                fact_ids_ordered=[sr.id for sr in scored_results],
+                text_by_id={sr.id: sr.retrieval.text for sr in scored_results},
                 max_tokens=max_tokens,
                 count_tokens=count_tokens,
                 observation_sources=observation_sources,
+                candidate_limit=rerank_limit,
             )
             total_tokens = selection.total_tokens
             # A promoted observation inherits its earliest source's position.
-            scored_by_id = {sr.id: sr for sr in top_scored}
+            scored_by_id = {sr.id: sr for sr in scored_results}
             top_scored = [scored_by_id[fid] for fid in selection.ids]
             step_duration = time.perf_counter() - step_start
             truncated_note = " (truncated)" if selection.truncated else ""

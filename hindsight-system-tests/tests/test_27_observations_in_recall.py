@@ -19,7 +19,8 @@ from __future__ import annotations
 
 import pytest
 
-from hindsight_system_tests.payloads import extracted, fact, observes
+from hindsight_system_tests import ChatRequest
+from hindsight_system_tests.payloads import Consolidation, Observation, batch_fact_id, extracted, fact, observes
 
 pytestmark = pytest.mark.asyncio
 
@@ -97,6 +98,57 @@ async def test_source_facts_are_absent_unless_asked_for(client, observed_bank):
     response = await client.arecall(bank_id=observed_bank, query=QUERY, types=["observation"])
 
     assert response.source_facts is None
+
+
+async def test_selected_observations_free_candidate_slots_for_independent_evidence(client, llm, bank_id, settled):
+    """A synthesis and its source fill the candidate window, with another answer
+    just beyond it. Delivering the synthesis must free its source's slot for that
+    independent answer, rather than returning a nearly empty token budget."""
+    flight = "The agent booked Alice a flight to Munich | Involving: Alice"
+    llm.on_step("extract_facts").returns(
+        extracted(
+            fact("Alice moved to Berlin", who="Alice", entities=["Alice", "Berlin"]),
+            fact(
+                "The agent booked Alice a flight to Munich",
+                fact_type="assistant",
+                who="Alice",
+                entities=["Alice", "Munich"],
+            ),
+        )
+    )
+
+    def synthesize(request: ChatRequest) -> Consolidation:
+        source_id = batch_fact_id(request, "Alice moved to Berlin")
+        return Consolidation(creates=[Observation(text=OBSERVATION, source_fact_ids=[source_id])] if source_id else [])
+
+    llm.on_step("consolidate").answers_with(synthesize)
+    await client.aretain(bank_id=bank_id, content="Alice moved to Berlin. The agent booked her a flight to Munich.")
+    await settled(bank_id)
+
+    # Each type contributes its own retrieval candidate, while this bank's low
+    # search budget limits packing to two candidates. Three short memories make
+    # the boundary visible without retaining hundreds of duplicates.
+    await client.banks.update_bank_config(bank_id, {"updates": {"recall_budget_fixed_low": 1}})
+    default = await client.arecall(
+        bank_id=bank_id, query="Alice Berlin", budget="low", max_tokens=1024, prefer_observations=False, trace=True
+    )
+    assert default.trace["query"]["budget"] == 1
+    assert [entry["text"] for entry in default.trace["reranked"]] == [BERLIN, OBSERVATION, flight]
+    assert [result.text for result in default.results] == [BERLIN, OBSERVATION]
+
+    preferred = await client.arecall(
+        bank_id=bank_id,
+        query="Alice Berlin",
+        budget="low",
+        max_tokens=1024,
+        prefer_observations=True,
+        include_source_facts=True,
+    )
+    assert [result.text for result in preferred.results] == [OBSERVATION, flight]
+    assert preferred.results[0].source_fact_ids == [default.results[0].id]
+    assert {source_id: source.text for source_id, source in preferred.source_facts.items()} == {
+        default.results[0].id: BERLIN
+    }
 
 
 async def test_oversized_synthesis_does_not_hide_deliverable_evidence(client, llm, bank_id, settled):

@@ -47,6 +47,7 @@ def select_facts_within_budget(
     max_tokens: int,
     count_tokens: Callable[[str], int],
     observation_sources: dict[str, list[str]] | None = None,
+    candidate_limit: int | None = None,
 ) -> FactSelection:
     """Pick the ranked facts that fit ``max_tokens``.
 
@@ -60,11 +61,20 @@ def select_facts_within_budget(
     (issue #364).
 
     ``observation_sources`` enables provenance-based observation preference. Only
-    observations in this ranked candidate window can replace sources. A fitting
+    observations supplied in this mapping can replace sources. A fitting
     observation inherits its earliest source's selection position; if it cannot
     fit, the source remains eligible. Merely citing a source never suppresses it.
     This is a provenance policy, not a claim of semantic equivalence.
+
+    ``candidate_limit`` bounds the ranked candidate window before token filtering.
+    Selected observations free their sources' positions for backfill from the tail;
+    facts skipped for exceeding the token budget do not. Only observations supplied
+    in ``observation_sources`` can replace sources, so callers can keep replacement
+    eligibility bounded to their original window while allowing source backfill.
     """
+    if candidate_limit is not None and candidate_limit <= 0:
+        return FactSelection(ids=[], total_tokens=0, truncated=False)
+
     if observation_sources:
         return _select_with_observation_preference(
             fact_ids_ordered=fact_ids_ordered,
@@ -72,7 +82,11 @@ def select_facts_within_budget(
             max_tokens=max_tokens,
             count_tokens=count_tokens,
             observation_sources=observation_sources,
+            candidate_limit=candidate_limit,
         )
+
+    if candidate_limit is not None:
+        fact_ids_ordered = fact_ids_ordered[:candidate_limit]
 
     selected: list[str] = []
     total_tokens = 0
@@ -110,11 +124,16 @@ def _select_with_observation_preference(
     max_tokens: int,
     count_tokens: Callable[[str], int],
     observation_sources: dict[str, list[str]],
+    candidate_limit: int | None,
 ) -> FactSelection:
     """Substitute and pack atomically, retaining raw evidence on budget failure."""
     costs = {fid: count_tokens(text_by_id[fid]) for fid in fact_ids_ordered if fid in text_by_id}
     if max_tokens <= 0:
-        return FactSelection(ids=[], total_tokens=0, truncated=bool(costs))
+        return FactSelection(
+            ids=[],
+            total_tokens=0,
+            truncated=any(fid in costs for fid in fact_ids_ordered[:candidate_limit]),
+        )
 
     sources = {
         oid: set(observation_sources[oid]) for oid in fact_ids_ordered if oid in observation_sources and oid in costs
@@ -128,6 +147,8 @@ def _select_with_observation_preference(
     superseded: set[str] = set()
     total_tokens = 0
     skipped = False
+    candidates_considered = 0
+    first_candidate: str | None = None
 
     selected_ids: set[str] = set()
 
@@ -148,18 +169,27 @@ def _select_with_observation_preference(
     # selected observation never needs to evict an already selected raw source,
     # and duplicate text never consumes tokens that need a second packing pass.
     for fid in fact_ids_ordered:
-        if fid not in costs or fid in selected_ids or fid in superseded:
+        if fid in selected_ids or fid in superseded:
             continue
+        if candidate_limit is not None and candidates_considered >= candidate_limit:
+            break
+        # Budget failures still occupy a candidate position. Only successful
+        # substitutions (including the promoted observation's later duplicate)
+        # make room for lower-ranked candidates beyond the original window.
+        candidates_considered += 1
+        if fid not in costs:
+            continue
+        if first_candidate is None:
+            first_candidate = fid
         if any(try_select(oid) for oid in replacements.get(fid, [])):
             continue
         if not try_select(fid):
             skipped = True
 
-    if not selected and costs:
+    if not selected and first_candidate is not None:
         # Preserve the existing positive-budget floor, including its explicit
         # overshoot accounting. Do not force an oversized replacement instead.
-        first = next(fid for fid in fact_ids_ordered if fid in costs)
-        selected = [first]
-        total_tokens = costs[first]
+        selected = [first_candidate]
+        total_tokens = costs[first_candidate]
 
     return FactSelection(ids=selected, total_tokens=total_tokens, truncated=skipped)
