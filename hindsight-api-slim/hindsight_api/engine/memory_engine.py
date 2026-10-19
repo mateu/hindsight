@@ -9247,8 +9247,11 @@ class MemoryEngine(MemoryEngineInterface):
             fact_type: List of fact types to recall (e.g., ['world', 'experience'])
             prefer_observations: When True and both 'observation' and a raw type ('world'/'experience')
                        are requested, drop raw facts that a returned observation was consolidated from
-                       (deduplication by provenance). Freed slots backfill, keeping the result count at
-                       the budget. No-op unless both observation and raw types are requested.
+                       (deduplication by provenance). Prefer a fitting observation at its source's
+                       rank position; keep the raw source eligible if it cannot fit. Substitution is
+                       bounded to observations in the original ranked candidate window. Sources
+                       replaced by a delivered observation free slots for backfill. No-op unless
+                       both types are requested.
                        None resolves to the bank's recall_prefer_observations config.
             budget: Budget level for graph traversal (low=100, mid=300, high=600 units)
             max_tokens: Maximum tokens to return (counts only 'text' field, default 4096)
@@ -10509,12 +10512,10 @@ class MemoryEngine(MemoryEngineInterface):
             if request_context is not None:
                 request_context.raise_if_cancelled()
 
-            # Step 4.8: prefer-observations dedup. When the caller asked for observations
-            # alongside raw facts, an observation supersedes the raw facts it was
-            # consolidated from: drop those raw facts so the same content isn't returned
-            # twice. Runs BEFORE the Step 5 truncation so the freed slots backfill with
-            # the next-best results, keeping the result count at the budget. No-op unless
-            # 'observation' and at least one raw type were both requested.
+            # Step 4.8: Resolve provenance, but do not drop any raw facts here.
+            # Previously a candidate observation suppressed sources before packing,
+            # even if the observation itself could not fit. Step 6 now substitutes
+            # only observations actually selected for delivery, with raw fallback.
             raw_types_requested = {"world", "experience"} & set(fact_type)
             if prefer_observations and "observation" in fact_type and raw_types_requested:
                 # "The observation list" = observations within the window we would return.
@@ -10526,7 +10527,6 @@ class MemoryEngine(MemoryEngineInterface):
                 observation_ids = [uuid.UUID(sr.id) for sr in observation_srs]
                 if observation_ids:
                     dedup_start = time.perf_counter()
-                    superseded_ids: set[str] = set()
                     from .memories import get_memories
 
                     # A backend that carries an observation's sources on the recalled result has
@@ -10556,21 +10556,6 @@ class MemoryEngine(MemoryEngineInterface):
                         time.perf_counter() - dedup_start,
                         {"observations_considered": len(observation_ids)},
                     )
-                    for sr in observation_srs:
-                        for sid in sr.retrieval.source_memory_ids or []:
-                            superseded_ids.add(str(sid))
-                    if superseded_ids:
-                        before_count = len(scored_results)
-                        scored_results = [
-                            sr
-                            for sr in scored_results
-                            if not (sr.retrieval.fact_type in ("world", "experience") and sr.id in superseded_ids)
-                        ]
-                        log_buffer.append(
-                            f"  [4.8] prefer_observations: dropped {before_count - len(scored_results)} "
-                            f"raw fact(s) superseded by {len(observation_ids)} observation(s)"
-                        )
-
             # Step 5: Truncate to thinking_budget * 2 for token filtering
             rerank_limit = thinking_budget * 2
             top_scored = scored_results[:rerank_limit]
@@ -10703,19 +10688,35 @@ class MemoryEngine(MemoryEngineInterface):
                     {"chunks_returned": len(chunks_dict or {}), "chunk_tokens": total_chunk_tokens},
                 )
 
-            # Step 6: Token budget filtering
+            # Step 6: Pack and substitute observations atomically. Chunk selection
+            # above retains its independent budget, including max_tokens=0.
+            raw_ids = {sr.id for sr in scored_results if sr.retrieval.fact_type in ("world", "experience")}
+            observation_sources = (
+                {
+                    sr.id: [str(sid) for sid in sr.retrieval.source_memory_ids or [] if str(sid) in raw_ids]
+                    for sr in top_scored
+                    if sr.retrieval.fact_type == "observation"
+                }
+                if prefer_observations and "observation" in fact_type and raw_types_requested
+                else None
+            )
+            # Keep replacement observations bounded to the original window, but
+            # let selected substitutions free slots for lower-ranked candidates.
+            # Cutting the input here would let superseded sources crowd those
+            # candidates out even when the answer has plenty of token budget.
             step_start = time.perf_counter()
-
             selection = select_facts_within_budget(
-                fact_ids_ordered=[sr.id for sr in top_scored],
-                text_by_id={sr.id: sr.retrieval.text for sr in top_scored},
+                fact_ids_ordered=[sr.id for sr in scored_results],
+                text_by_id={sr.id: sr.retrieval.text for sr in scored_results},
                 max_tokens=max_tokens,
                 count_tokens=count_tokens,
+                observation_sources=observation_sources,
+                candidate_limit=rerank_limit,
             )
             total_tokens = selection.total_tokens
-            selected_ids = set(selection.ids)
-            top_scored = [sr for sr in top_scored if sr.id in selected_ids]
-
+            # A promoted observation inherits its earliest source's position.
+            scored_by_id = {sr.id: sr for sr in scored_results}
+            top_scored = [scored_by_id[fid] for fid in selection.ids]
             step_duration = time.perf_counter() - step_start
             truncated_note = " (truncated)" if selection.truncated else ""
             log_buffer.append(
