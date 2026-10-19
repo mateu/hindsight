@@ -97,3 +97,23 @@ async def test_source_facts_are_absent_unless_asked_for(client, observed_bank):
     response = await client.arecall(bank_id=observed_bank, query=QUERY, types=["observation"])
 
     assert response.source_facts is None
+
+
+async def test_oversized_synthesis_does_not_hide_deliverable_evidence(client, llm, bank_id, settled):
+    """An observation was deduping away its raw evidence, then itself failing
+    packing. The same retained knowledge must still answer with its raw fact."""
+    long_observation = "Alice lives in Berlin. " * 400
+    llm.on_step("extract_facts").returns(
+        extracted(fact("Alice moved to Berlin", who="Alice", entities=["Alice", "Berlin"]))
+    )
+    llm.on_step("consolidate").answers_with(observes(long_observation))
+    await client.aretain(bank_id=bank_id, content="Alice moved to Berlin.")
+    await settled(bank_id)
+
+    # Establish that the synthesis really exists, rather than passing because
+    # consolidation never created the candidate that triggers the bug.
+    observations = await client.arecall(bank_id=bank_id, query=QUERY, types=["observation"], max_tokens=10000)
+    assert [r.text for r in observations.results] == [long_observation]
+    response = await client.arecall(bank_id=bank_id, query=QUERY, prefer_observations=True, max_tokens=1024)
+    assert [r.text for r in response.results] == [BERLIN]
+    assert response.results[0].type == "world"
